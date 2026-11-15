@@ -1,0 +1,101 @@
+name: Test and deploy to Elastic Beanstalk
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Test and build Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI: "true"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        # This repository does not yet track a lockfile.
+        run: npm install --no-package-lock --no-audit --no-fund
+
+      - name: Run tests
+        run: npm test -- --watchAll=false --runInBand
+
+      - name: Build production Docker image
+        run: docker build --build-arg CI=true --tag "docker-frontend:${GITHUB_SHA}" .
+
+  deploy:
+    name: Deploy to production
+    needs: verify
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: production
+    concurrency:
+      group: elastic-beanstalk-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      EB_APPLICATION_NAME: ${{ vars.EB_APPLICATION_NAME }}
+      EB_ENVIRONMENT_NAME: ${{ vars.EB_ENVIRONMENT_NAME }}
+      EB_S3_BUCKET: ${{ vars.EB_S3_BUCKET }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate deployment configuration
+        run: |
+          for name in AWS_REGION AWS_ROLE_ARN EB_APPLICATION_NAME EB_ENVIRONMENT_NAME EB_S3_BUCKET; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Set the production environment variable $name. See docs/aws-deployment.md."
+              exit 1
+            fi
+          done
+
+      - name: Package production source
+        # Exclude the development Compose services and local configuration.
+        run: zip -r "$RUNNER_TEMP/deploy.zip" Dockerfile .dockerignore package.json src public
+
+      - name: Authenticate to AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-${{ github.run_id }}
+
+      - name: Deploy and wait for environment health
+        uses: aws-actions/aws-elasticbeanstalk-deploy@v1
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          application-name: ${{ env.EB_APPLICATION_NAME }}
+          environment-name: ${{ env.EB_ENVIRONMENT_NAME }}
+          s3-bucket-name: ${{ env.EB_S3_BUCKET }}
+          deployment-package-path: ${{ runner.temp }}/deploy.zip
+          version-label: github-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          create-application-if-not-exists: "false"
+          create-environment-if-not-exists: "false"
+          create-s3-bucket-if-not-exists: "false"
+          wait-for-deployment: "true"
+          wait-for-environment-recovery: "true"
+          deployment-timeout: "900"
